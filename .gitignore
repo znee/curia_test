@@ -1,0 +1,29 @@
+# Credentials and logs
+hf log in log.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Data files (large)
+*.npz
+*.npy
+*.nii
+*.nii.gz
+*.dcm
+data/
+test_data/
+
+# macOS
+.DS_Store
+
+# IDE
+.claude/
+.vscode/
+.idea/
