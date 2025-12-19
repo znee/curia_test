@@ -1,389 +1,344 @@
 # CURIA Testing Framework
 
-A comprehensive testing and evaluation framework for [CURIA](https://arxiv.org/abs/2509.06830), a vision foundation model for radiology trained on 150,000 exams (130TB).
+A comprehensive testing and evaluation framework for [CURIA](https://huggingface.co/raidium/curia), a DINOv2-based vision foundation model for radiology trained on 150,000 exams (130TB).
 
 ## Quick Start
 
 ```bash
 # Activate environment
-conda activate curia
+source /home/jinheej7/curia/venv/bin/activate
 
 # Login to HuggingFace (required - gated model)
 huggingface-cli login
 
-# Generate test data
-python create_test_data.py
-
 # Launch GUI
+cd /home/jinheej7/curia/curia_test
 python curia_gui.py
 # Open http://localhost:7860
 ```
 
+## Available Classification Heads
+
+All heads output **class probabilities** (not images). Verified class counts from model:
+
+### Brain Imaging
+| Head | Classes | Task | Input |
+|------|---------|------|-------|
+| `oasis` | 2 | Dementia detection (non-demented/demented) | Structural T1 MRI |
+| `ich` | 2 | Hemorrhage detection (no/yes) | Non-contrast head CT |
+| `atlas-stroke` | 2 | Stroke detection (no/yes) | T1w brain MRI |
+| `ixi` | 1 | Brain tissue analysis | T1/T2 brain MRI |
+
+### Chest Imaging
+| Head | Classes | Task | Input |
+|------|---------|------|-------|
+| `covidx-ct` | 3 | COVID detection (normal/COVID/non-COVID) | Chest CT |
+| `luna16-3D` | 2 | Lung nodule detection (no/yes) | Low-dose chest CT |
+
+### Abdominal Imaging
+| Head | Classes | Task | Input |
+|------|---------|------|-------|
+| `abdominal-trauma` | 2 | Trauma detection (no/yes) | Abdominal CT |
+| `kits` | 2 | Kidney tumor detection (no/yes) | Contrast CT |
+| `anatomy-ct` | 54 | Organ identification | Any CT |
+
+### Spine Imaging
+| Head | Classes | Task | Input |
+|------|---------|------|-------|
+| `neural_foraminal_narrowing` | 3 | Stenosis severity (normal/moderate/severe) | Spine MRI |
+| `spinal_canal_stenosis` | 3 | Stenosis severity (normal/moderate/severe) | Spine MRI |
+| `subarticular_stenosis` | 3 | Stenosis severity (normal/moderate/severe) | Spine MRI |
+
+### Musculoskeletal
+| Head | Classes | Task | Input |
+|------|---------|------|-------|
+| `kneeMRI` | 3 | Knee pathology (normal/partial/complete tear) | Knee MRI |
+
+### General Purpose
+| Head | Classes | Task | Input |
+|------|---------|------|-------|
+| `anatomy-mri` | 56 | Organ identification | Any MRI |
+| `deep-lesion-site` | 8 | Lesion anatomical site | CT with lesions |
+| `emidec-classification-mask` | 2 | Lesion classification | CT/MRI with mask |
+
+---
+
+## How Masks Work
+
+Masks enable **region-specific analysis** by focusing the model on particular areas.
+
+### Mask Types
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      MASK PROMPTING                         │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  INPUT                    MASK                   OUTPUT     │
+│  ┌─────────┐             ┌─────────┐                        │
+│  │         │             │  ████   │                        │
+│  │  Image  │      +      │  ████   │   →   Classification   │
+│  │         │             │         │        (masked region) │
+│  └─────────┘             └─────────┘                        │
+│                                                             │
+│  Mask = Binary array (0 or 1)                               │
+│  1 = Region of interest                                     │
+│  0 = Ignored                                                │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Creating Masks
+
+**1. Point Prompts (GUI)**
+```
+Click on image → Creates circular mask (radius=15px)
+Multiple clicks → Combined into single mask
+```
+
+**2. Box Prompts (CLI)**
+```python
+# Create rectangular mask
+mask = tester.mask_prompt.create_box_mask(
+    image_shape=(H, W),
+    boxes=[(x1, y1, x2, y2)]
+)
+```
+
+**3. Load External Mask**
+```python
+# From NIfTI, NumPy, or image file
+mask = tester.mask_prompt.load_mask("mask.nii.gz")
+```
+
+### Mask Processing Flow
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    MASK PROCESSING                          │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  1. RESIZE                                                  │
+│     Mask resized to 512x512 (model input size)              │
+│                                                             │
+│  2. TOKENIZE                                                │
+│     Image divided into 32x32 = 1024 patches (16px each)     │
+│     Mask downsampled to patch grid                          │
+│                                                             │
+│  3. EXTRACT                                                 │
+│     Masked patches → Average pooled features                │
+│     OR: Cross-attention with mask query                     │
+│                                                             │
+│  4. CLASSIFY                                                │
+│     Masked features → Classification head → Probabilities   │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 2D vs 3D Masks
+
+| Mask Type | Shape | Behavior |
+|-----------|-------|----------|
+| **2D mask** | `(H, W)` | Same mask applied to ALL slices |
+| **3D mask** | `(H, W, Z)` | Per-slice masks, indexed `mask[:, :, slice_idx]` |
+
+```python
+# 2D mask - broadcast to all slices
+mask_2d = np.zeros((256, 256), dtype=np.float32)
+mask_2d[100:150, 100:150] = 1.0
+
+# 3D mask - different mask per slice
+mask_3d = np.zeros((256, 256, 100), dtype=np.float32)
+mask_3d[100:150, 100:150, 50:60] = 1.0  # Only slices 50-60
+
+# Use with volume
+results = tester.process_volume(volume, mask=mask_2d)  # Same mask all slices
+results = tester.process_volume(volume, mask=mask_3d)  # Per-slice masks
+```
+
+### When to Use Masks
+
+| Use Case | Mask Type | Example |
+|----------|-----------|---------|
+| Lesion classification | Point/Box | Click on tumor, classify malignancy |
+| Region-specific anatomy | Loaded mask | Segment liver, classify anatomy |
+| Attention focus | Any | Focus model on specific organ |
+| Exclude artifacts | Inverse mask | Mask out metal artifacts |
+
+---
+
+## Extract Features vs Classify
+
+| Aspect | Extract Features | Classify |
+|--------|------------------|----------|
+| **Output** | 768-dimensional vector per slice | Class probabilities + prediction |
+| **Classifier needed** | No (uses backbone only) | Yes (requires classification head) |
+| **3D behavior** | Processes ALL slices | Processes CURRENT slice only |
+| **Purpose** | Downstream tasks, similarity search, clustering | Get diagnostic prediction |
+
+### Extract Features
+Uses Curia's DINOv2 backbone to generate **embeddings** (numerical representations):
+```
+Image → Backbone → [768 numbers]
+```
+- Output: Dense feature vector capturing image content
+- For 3D volumes: Returns features for ALL slices `[num_slices, 768]`
+- Use cases: Train your own classifier, find similar images, clustering
+
+### Classify
+Uses backbone + task-specific classification head:
+```
+Image → Backbone → Classification Head → [class probabilities]
+```
+- Output: Probability for each class (e.g., "Demented: 85%, Non-demented: 15%")
+- For 3D volumes: Runs on **current slice only** (interactive, slice-wise)
+- Use cases: Get diagnostic prediction for specific clinical task
+
+### When to Use Which
+
+| Goal | Use |
+|------|-----|
+| Get a diagnosis/prediction | Classify |
+| Build custom ML model | Extract Features |
+| Compare/cluster scans | Extract Features |
+| Explore model attention | Attention Map |
+
+---
+
+## Output Types
+
+### 1. Classification (All Heads)
+```python
+result = tester.classify(image, mask=None)
+# Returns:
+{
+    "logits": np.array([...]),        # Raw outputs
+    "probabilities": np.array([...]), # Softmax probs
+    "prediction": int                  # Argmax class
+}
+```
+
+### 2. Attention Map (Image Output)
+```python
+attn_map = tester.get_attention_map(image)
+# Returns: np.array shape (512, 512)
+# Heatmap showing where model focuses
+```
+
+### 3. Feature Extraction
+```python
+# Single slice
+features = tester.extract_features(image, mask=None)
+# Returns: {"last_hidden_state": [1, 1025, 768], ...}
+
+# 3D volume - slice-wise features
+results = tester.process_volume(volume)
+# Returns:
+{
+    "slice_features": np.array([num_slices, 768]),
+    "aggregated_features": torch.Tensor([768]),  # mean
+    "aggregated_features_max": torch.Tensor([768]),
+    "aggregated_features_std": torch.Tensor([768]),
+    "per_slice_predictions": [...]  # if classifier loaded
+}
+```
+
+### 4. Export Features
+```python
+# Export to JSON (full data)
+tester.export_features_to_json(results, "features.json")
+
+# Export to CSV (tabular)
+tester.export_features_to_csv(results, "features.csv")
+```
+
+---
+
+## Data Format
+
+### Volume Convention: `(H, W, Z)`
+
+- **H**: Height (rows)
+- **W**: Width (columns)
+- **Z**: Slices (last axis)
+
+```python
+# Correct slice access
+slice_img = volume[:, :, slice_idx]
+
+# NOT this (wrong axis)
+slice_img = volume[slice_idx]  # Wrong!
+```
+
+### Supported Formats
+
+| Format | Extension | Notes |
+|--------|-----------|-------|
+| NIfTI | `.nii`, `.nii.gz` | Use `.gz` in Gradio uploads |
+| DICOM | `.dcm`, folder | Single file or series |
+| NumPy | `.npy`, `.npz` | Direct array loading |
+
+---
+
 ## Project Structure
 
 ```
-2026_curia/
+curia_test/
 ├── README.md                 # This file
-├── CURIA_TESTING_GUIDE.md   # Detailed usage documentation
-├── requirements.txt          # Python dependencies
-│
-├── curia_tester.py          # Core testing API and CLI
-├── curia_gui.py             # Gradio web interface
-├── preprocessing.py          # Normalization and slice selection
-├── create_test_data.py      # Synthetic test data generator
-│
-├── curia_repo/              # Cloned CURIA source (reference)
-├── data/                    # Real test data
-│   └── T1.nii.gz           # Sample T1 MRI
-└── test_data/               # Generated synthetic data
+├── CURIA_CAPABILITIES.md     # Detailed head documentation
+├── curia_tester.py           # Core API and CLI
+├── curia_gui.py              # Gradio web interface
+├── preprocessing.py          # Normalization, slice selection
+├── save_visualization.py     # Save attention overlays
+├── create_test_data.py       # Synthetic data generator
+├── data/                     # Your uploaded scans
+├── test_data/                # Synthetic test samples
+└── outputs/                  # Exported features/visualizations
 ```
 
-## Architecture Overview
+---
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    CURIA Testing Framework                       │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐       │
-│  │   curia_gui  │    │ curia_tester │    │preprocessing │       │
-│  │   (Gradio)   │───▶│   (Core)     │◀───│  (Utils)     │       │
-│  └──────────────┘    └──────────────┘    └──────────────┘       │
-│         │                   │                   │                │
-│         │                   ▼                   │                │
-│         │           ┌──────────────┐            │                │
-│         │           │MedicalImage  │            │                │
-│         │           │   Loader     │            │                │
-│         │           └──────────────┘            │                │
-│         │                   │                   │                │
-│         ▼                   ▼                   ▼                │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │              HuggingFace Transformers                    │    │
-│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────┐  │    │
-│  │  │  Processor  │  │  Backbone   │  │ Classification  │  │    │
-│  │  │(CuriaImage  │  │ (DINOv2     │  │    Heads        │  │    │
-│  │  │ Processor)  │  │  ViT-B)     │  │ (atlas-stroke,  │  │    │
-│  │  │             │  │             │  │  anatomy-mri)   │  │    │
-│  │  └─────────────┘  └─────────────┘  └─────────────────┘  │    │
-│  └─────────────────────────────────────────────────────────┘    │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
+## GUI Features
 
-## Key Components
+1. **Load Model**: Select head, device, authenticate
+2. **Load Image**: Upload NIfTI/DICOM/NumPy
+3. **Slice Navigation**: Browse 3D volumes with slider
+4. **Preprocessing**: CT windows, normalization
+5. **Mask Prompting**: Click to add point masks
+6. **Analysis**:
+   - **Extract Features** → Processes all slices, export JSON/CSV
+   - **Classify** → Prediction + attention map for current slice
 
-### 1. `curia_tester.py` - Core Testing API
+---
 
-**Classes:**
-- `CuriaConfig` - Configuration dataclass (model name, device, heads)
-- `MedicalImageLoader` - Loads DICOM, NIfTI, NumPy formats
-- `MaskPrompt` - Creates and transforms mask prompts
-- `CuriaTester` - Main testing interface
+## CLI Usage
 
-**Key Methods:**
-```python
-tester = CuriaTester(config)
-tester.load_model(load_classifier=True)
+```bash
+# Interactive mode
+python curia_tester.py --interactive
 
-# Feature extraction
-features = tester.extract_features(image, mask=None)
+# Classify single image
+python curia_tester.py -i scan.nii.gz --mode classify --head oasis
 
-# Classification
-result = tester.classify(image, mask=None)
+# Extract features
+python curia_tester.py -i scan.nii.gz --mode features -o features.npz
 
-# Volume processing
-results = tester.process_volume(volume, mask=None, slice_axis=-1)
+# With mask
+python curia_tester.py -i scan.nii.gz --mask roi.nii.gz --mode classify --head ich
 
-# Attention visualization
-attn_map = tester.get_attention_map(image)
+# Point prompts
+python curia_tester.py -i scan.nii.gz --points "100,100;150,150" --mode features
 ```
 
-### 2. `curia_gui.py` - Web Interface
-
-Gradio-based GUI with:
-- Model configuration (head selection, device)
-- Preprocessing controls (modality, CT windows, normalization)
-- Slice navigation for 3D volumes
-- Interactive point/box prompting
-- Feature extraction and classification
-
-### 3. `preprocessing.py` - Image Preprocessing
-
-**Classes:**
-- `Normalizer` - CT windowing, MRI percentile normalization
-- `SliceSelector` - Uniform, content-based, center selection
-- `Resampler` - Image resizing
-- `Preprocessor` - Combined pipeline
-
-**CT Windows Available:**
-| Window | Center | Width | Use Case |
-|--------|--------|-------|----------|
-| brain | 40 | 80 | Brain parenchyma |
-| brain_stroke | 40 | 40 | Acute stroke |
-| lung | -600 | 1500 | Lung parenchyma |
-| soft_tissue | 40 | 400 | General soft tissue |
-| bone | 400 | 2000 | Bone structures |
-
-## Data Format Conventions
-
-### Volume Orientation
-
-**Standard format:** `(H, W, Z)` - Height, Width, Slices
-
-- Slice dimension is **last** (axis=-1)
-- Processor iterates `volume[:, :, i]` for each slice
-- NIfTI files loaded in native (X, Y, Z) treated as (H, W, Z)
-
-### Mask Handling
-
-- **2D mask** `(H, W)`: Broadcast to all slices in volume
-- **3D mask** `(H, W, Z)`: Per-slice masks, indexed along last axis
-- For classification: 3D masks use middle slice
-
-## Known Issues (Fixed)
-
-The following issues have been identified and fixed:
-
-| Issue | Location | Fix |
-|-------|----------|-----|
-| 3D slice axis mismatch | `curia_tester.py:207-225` | Keep NIfTI as (H,W,Z), don't transpose |
-| 3D mask crash | `curia_tester.py:540-549` | Extract middle slice for 2D classifier |
-| CLI 2D mask for 3D volume | `curia_tester.py:609-671` | Support 2D mask broadcast |
-| Help recursion | `curia_tester.py:714-729` | Print help inline, don't recurse |
-| GUI normalize checkbox | `curia_gui.py:58-68` | Store and use normalize state |
-
-## Refactoring Recommendations
-
-### Phase 1: Core Improvements
-
-1. **Unified Volume Handler**
-   ```python
-   class VolumeHandler:
-       """Consistent 3D volume handling across all components."""
-       def __init__(self, volume, slice_axis=-1, metadata=None):
-           self.data = volume
-           self.slice_axis = slice_axis
-           self.num_slices = volume.shape[slice_axis]
-
-       def get_slice(self, idx):
-           """Get slice by index, handling any axis."""
-           ...
-
-       def iterate_slices(self, indices=None):
-           """Yield (index, slice) tuples."""
-           ...
-   ```
-
-2. **Mask Manager**
-   ```python
-   class MaskManager:
-       """Handle mask creation, loading, and transformation."""
-       def __init__(self, volume_shape, slice_axis=-1):
-           ...
-
-       def add_point(self, point, radius=20):
-           """Add point prompt, expand to volume if needed."""
-
-       def add_box(self, box):
-           """Add box prompt."""
-
-       def get_slice_mask(self, idx):
-           """Get mask for specific slice."""
-   ```
-
-3. **Configuration Validation**
-   ```python
-   @dataclass
-   class CuriaConfig:
-       ...
-       def __post_init__(self):
-           self.validate()
-
-       def validate(self):
-           if self.subfolder and self.subfolder not in self.AVAILABLE_HEADS:
-               raise ValueError(f"Unknown head: {self.subfolder}")
-   ```
-
-### Phase 2: Testing Infrastructure
-
-1. **Add Unit Tests**
-   ```
-   tests/
-   ├── test_loader.py        # MedicalImageLoader tests
-   ├── test_preprocessing.py # Normalization, slice selection
-   ├── test_mask.py          # Mask prompting
-   ├── test_volume.py        # 3D volume processing
-   └── test_integration.py   # End-to-end tests
-   ```
-
-2. **Test Fixtures**
-   ```python
-   @pytest.fixture
-   def sample_volume():
-       return np.random.randn(224, 224, 100).astype(np.float32)
-
-   @pytest.fixture
-   def sample_mask_2d():
-       mask = np.zeros((224, 224), dtype=np.float32)
-       mask[50:150, 50:150] = 1.0
-       return mask
-   ```
-
-3. **Integration Tests**
-   ```python
-   def test_3d_volume_with_2d_mask():
-       """Ensure 2D masks work with 3D volumes."""
-       ...
-
-   def test_3d_volume_with_3d_mask():
-       """Ensure 3D masks work correctly."""
-       ...
-
-   def test_gui_preprocessing_toggle():
-       """Ensure preprocessing checkbox affects output."""
-       ...
-   ```
-
-### Phase 3: Extension Points
-
-1. **Plugin Architecture for Heads**
-   ```python
-   class ClassificationHead(ABC):
-       @abstractmethod
-       def predict(self, features: torch.Tensor) -> Dict:
-           pass
-
-       @property
-       @abstractmethod
-       def num_classes(self) -> int:
-           pass
-
-   class StrokeHead(ClassificationHead):
-       ...
-
-   class AnatomyHead(ClassificationHead):
-       ...
-   ```
-
-2. **Custom Preprocessing Pipelines**
-   ```python
-   class PreprocessingPipeline:
-       def __init__(self):
-           self.steps = []
-
-       def add_step(self, step: Callable):
-           self.steps.append(step)
-
-       def process(self, image):
-           for step in self.steps:
-               image = step(image)
-           return image
-   ```
-
-3. **Results Export**
-   ```python
-   class ResultsExporter:
-       def to_json(self, results, path):
-           ...
-
-       def to_nifti(self, attention_map, reference_nifti, path):
-           """Save attention map as NIfTI overlay."""
-           ...
-
-       def to_dicom_sr(self, results, reference_dicom, path):
-           """Save as DICOM Structured Report."""
-           ...
-   ```
-
-### Phase 4: Production Readiness
-
-1. **Logging**
-   ```python
-   import logging
-   logger = logging.getLogger("curia")
-
-   class CuriaTester:
-       def load_model(self, ...):
-           logger.info(f"Loading model from {self.config.model_name}")
-           ...
-   ```
-
-2. **Error Handling**
-   ```python
-   class CuriaError(Exception):
-       """Base exception for CURIA errors."""
-
-   class ModelNotLoadedError(CuriaError):
-       """Raised when model methods called before load."""
-
-   class InvalidMaskError(CuriaError):
-       """Raised when mask dimensions don't match image."""
-   ```
-
-3. **Caching**
-   ```python
-   from functools import lru_cache
-
-   class CuriaTester:
-       @lru_cache(maxsize=100)
-       def _cached_preprocess(self, image_hash):
-           ...
-   ```
-
-## Performance Benchmarks
-
-| Device | Inference Time | Throughput |
-|--------|----------------|------------|
-| Apple M1 (MPS) | ~44ms | 22 img/sec |
-| NVIDIA RTX 3090 | ~15ms | 66 img/sec |
-| CPU (i9) | ~200ms | 5 img/sec |
-
-## Usage Examples
-
-### Basic Classification
-
-```python
-from curia_tester import CuriaTester, CuriaConfig
-
-config = CuriaConfig(subfolder='atlas-stroke')
-tester = CuriaTester(config)
-tester.load_model(load_classifier=True)
-
-import nibabel as nib
-volume = nib.load('data/T1.nii.gz').get_fdata()
-
-# Process single slice
-mid_slice = volume[:, :, volume.shape[-1] // 2]
-result = tester.classify(mid_slice)
-print(f"Stroke probability: {result['probabilities'][0][1]:.2%}")
-```
-
-### Volume Processing with Mask
-
-```python
-from preprocessing import SliceSelector
-import numpy as np
-
-# Select informative slices
-selector = SliceSelector(method='content', num_slices=10)
-indices = selector.select(volume, axis=-1)
-
-# Create region mask
-mask = np.zeros(volume.shape[:2], dtype=np.float32)
-mask[100:150, 100:150] = 1.0  # 2D mask broadcast to all slices
-
-# Process volume
-results = tester.process_volume(volume, mask=mask, slice_indices=indices)
-print(f"Analyzed {len(indices)} slices")
-```
-
-## License
-
-- **CURIA Model**: CC BY-NC-ND 4.0 (Research only, non-commercial)
-- **This Framework**: MIT
+---
 
 ## References
 
 - [CURIA Paper](https://arxiv.org/abs/2509.06830)
 - [HuggingFace Model](https://huggingface.co/raidium/curia)
 - [GitHub Repository](https://github.com/raidium-med/curia)
+
+## License
+
+- **CURIA Model**: Research-only RAIL-M License
+- **This Framework**: MIT

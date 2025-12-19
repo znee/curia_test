@@ -27,3 +27,5 @@ test_data/
 .claude/
 .vscode/
 .idea/
+outputs/
+data/

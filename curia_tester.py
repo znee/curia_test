@@ -418,6 +418,7 @@ class CuriaTester:
             self.config.model_name,
             trust_remote_code=True,
             token=token,
+            attn_implementation="eager",  # Required for attention map output
         ).to(self.device)
         self.backbone.eval()
 
@@ -680,12 +681,113 @@ class CuriaTester:
                 pred = self.classify(slice_img, mask=slice_mask)
                 results["per_slice_predictions"].append(pred)
 
-        # Aggregate features
+        # Stack and store all slice features
         if results["per_slice_features"]:
-            all_features = torch.stack(results["per_slice_features"])
-            results["aggregated_features"] = all_features.mean(dim=0)
+            all_features = torch.stack(results["per_slice_features"])  # [num_slices, 1, 768]
+            all_features = all_features.squeeze(1)  # [num_slices, 768]
+
+            # Store as numpy for easy export
+            results["slice_features"] = all_features.numpy()  # [num_slices, 768]
+
+            # Aggregation methods
+            results["aggregated_features"] = all_features.mean(dim=0)  # [768] - mean
+            results["aggregated_features_max"] = all_features.max(dim=0).values  # [768] - max pooling
+            results["aggregated_features_std"] = all_features.std(dim=0)  # [768] - std deviation
+
+            # Summary stats
+            results["num_slices"] = len(slice_indices)
+            results["feature_dim"] = all_features.shape[1]
 
         return results
+
+    def export_features_to_csv(
+        self,
+        results: Dict[str, Any],
+        output_path: str,
+        include_header: bool = True
+    ) -> str:
+        """
+        Export slice-wise features to CSV.
+
+        Args:
+            results: Output from process_volume()
+            output_path: Path to save CSV
+            include_header: Whether to include column headers
+
+        Returns:
+            Path to saved file
+        """
+        import csv
+
+        if "slice_features" not in results:
+            raise ValueError("No slice features found. Run process_volume() first.")
+
+        slice_features = results["slice_features"]
+        slice_indices = results["slice_indices"]
+        feature_dim = slice_features.shape[1]
+
+        with open(output_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+
+            if include_header:
+                header = ["slice_idx"] + [f"feat_{i}" for i in range(feature_dim)]
+                writer.writerow(header)
+
+            for i, idx in enumerate(slice_indices):
+                row = [idx] + slice_features[i].tolist()
+                writer.writerow(row)
+
+        return output_path
+
+    def export_features_to_json(
+        self,
+        results: Dict[str, Any],
+        output_path: str,
+        include_predictions: bool = True
+    ) -> str:
+        """
+        Export features and predictions to JSON.
+
+        Args:
+            results: Output from process_volume()
+            output_path: Path to save JSON
+            include_predictions: Whether to include per-slice predictions
+
+        Returns:
+            Path to saved file
+        """
+        import json
+
+        export_data = {
+            "num_slices": results.get("num_slices", 0),
+            "feature_dim": results.get("feature_dim", 768),
+            "slice_indices": results.get("slice_indices", []),
+            "aggregated_features": {
+                "mean": results.get("aggregated_features", torch.zeros(768)).tolist()
+                    if hasattr(results.get("aggregated_features", None), "tolist")
+                    else results.get("aggregated_features", []),
+                "max": results.get("aggregated_features_max", torch.zeros(768)).tolist()
+                    if hasattr(results.get("aggregated_features_max", None), "tolist")
+                    else results.get("aggregated_features_max", []),
+                "std": results.get("aggregated_features_std", torch.zeros(768)).tolist()
+                    if hasattr(results.get("aggregated_features_std", None), "tolist")
+                    else results.get("aggregated_features_std", []),
+            },
+            "slice_features": results.get("slice_features", np.array([])).tolist(),
+        }
+
+        if include_predictions and results.get("per_slice_predictions"):
+            export_data["per_slice_predictions"] = []
+            for pred in results["per_slice_predictions"]:
+                export_data["per_slice_predictions"].append({
+                    "prediction": int(pred["prediction"]),
+                    "probabilities": pred["probabilities"].tolist() if hasattr(pred["probabilities"], "tolist") else pred["probabilities"],
+                })
+
+        with open(output_path, 'w') as f:
+            json.dump(export_data, f, indent=2)
+
+        return output_path
 
 
 def create_interactive_session(tester: CuriaTester):
@@ -834,9 +936,10 @@ def create_interactive_session(tester: CuriaTester):
                     continue
 
                 # Create mask from prompts if no explicit mask
+                # For 3D (H, W, Z), use shape[:2] to get (H, W)
                 mask_to_use = current_mask
                 if mask_to_use is None and (point_prompts or box_prompts):
-                    img_shape = current_image.shape[-2:]
+                    img_shape = current_image.shape[:2]  # (H, W)
                     if point_prompts:
                         mask_to_use = tester.mask_prompt.create_point_mask(img_shape, point_prompts)
                     if box_prompts:
@@ -869,9 +972,10 @@ def create_interactive_session(tester: CuriaTester):
                     print("No classifier loaded. Use 'set_head <name>' first.")
                     continue
 
+                # For 3D (H, W, Z), use shape[:2] to get (H, W)
                 mask_to_use = current_mask
                 if mask_to_use is None and (point_prompts or box_prompts):
-                    img_shape = current_image.shape[-2:]
+                    img_shape = current_image.shape[:2]  # (H, W)
                     if point_prompts:
                         mask_to_use = tester.mask_prompt.create_point_mask(img_shape, point_prompts)
                     if box_prompts:
@@ -882,11 +986,11 @@ def create_interactive_session(tester: CuriaTester):
                             mask_to_use = np.maximum(mask_to_use, box_mask)
 
                 try:
-                    # For 3D, use middle slice
+                    # For 3D, use middle slice (format is H, W, Z)
                     if current_image.ndim == 3:
-                        slice_idx = current_image.shape[0] // 2
-                        img = current_image[slice_idx]
-                        mask = mask_to_use[slice_idx] if mask_to_use is not None else None
+                        slice_idx = current_image.shape[-1] // 2
+                        img = current_image[:, :, slice_idx]
+                        mask = mask_to_use[:, :, slice_idx] if mask_to_use is not None and mask_to_use.ndim == 3 else mask_to_use
                     else:
                         img = current_image
                         mask = mask_to_use
@@ -905,8 +1009,9 @@ def create_interactive_session(tester: CuriaTester):
                     continue
 
                 try:
+                    # For 3D, use middle slice (format is H, W, Z)
                     if current_image.ndim == 3:
-                        img = current_image[current_image.shape[0] // 2]
+                        img = current_image[:, :, current_image.shape[-1] // 2]
                     else:
                         img = current_image
 
@@ -1002,16 +1107,17 @@ Examples:
         mask = tester.mask_prompt.load_mask(args.mask)
         print(f"Loaded mask with shape: {mask.shape}")
 
+    # For 3D (H, W, Z), use shape[:2] to get (H, W)
     if args.points:
         points = [tuple(map(int, p.split(','))) for p in args.points.split(';')]
-        img_shape = image.shape[-2:]
+        img_shape = image.shape[:2]  # (H, W)
         point_mask = tester.mask_prompt.create_point_mask(img_shape, points)
         mask = point_mask if mask is None else np.maximum(mask, point_mask)
         print(f"Created point mask from {len(points)} points")
 
     if args.boxes:
         boxes = [tuple(map(int, b.split(','))) for b in args.boxes.split(';')]
-        img_shape = image.shape[-2:]
+        img_shape = image.shape[:2]  # (H, W)
         box_mask = tester.mask_prompt.create_box_mask(img_shape, boxes)
         mask = box_mask if mask is None else np.maximum(mask, box_mask)
         print(f"Created box mask from {len(boxes)} boxes")
@@ -1043,10 +1149,12 @@ Examples:
             return
 
         print("Classifying...")
+        # For 3D (H, W, Z), use middle slice on last axis
         if image.ndim == 3:
-            image = image[image.shape[0] // 2]
-            if mask is not None:
-                mask = mask[mask.shape[0] // 2]
+            slice_idx = image.shape[-1] // 2
+            image = image[:, :, slice_idx]
+            if mask is not None and mask.ndim == 3:
+                mask = mask[:, :, slice_idx]
 
         result = tester.classify(image, mask=mask)
         print(f"\nClassification result:")
@@ -1059,8 +1167,9 @@ Examples:
 
     elif args.mode == "attention":
         print("Generating attention map...")
+        # For 3D (H, W, Z), use middle slice on last axis
         if image.ndim == 3:
-            image = image[image.shape[0] // 2]
+            image = image[:, :, image.shape[-1] // 2]
 
         attn_map = tester.get_attention_map(image)
 
